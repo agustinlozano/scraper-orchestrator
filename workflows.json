@@ -1,0 +1,182 @@
+{
+  "Comment": "Orchestrator: webscanner -> pipeline-refinery -> botline",
+  "StartAt": "RunWebscanner",
+  "States": {
+    "RunWebscanner": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-2:<your_account_id>:function:<scraper_service>",
+      "TimeoutSeconds": 120,
+      "ResultPath": "$.scraper",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "BuildProcessingRequest"
+    },
+    "BuildProcessingRequest": {
+      "Type": "Pass",
+      "Parameters": {
+        "processingRequest": {
+          "scrapingResponse.$": "$.scraper",
+          "options": {
+            "generateEmbeddings": true,
+            "extractKeywords": true,
+            "structureContent": true,
+            "model": "gpt-4o-mini"
+          }
+        }
+      },
+      "ResultPath": "$.toProcess",
+      "Next": "ProcessPipeline"
+    },
+    "ProcessPipeline": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::http:invoke",
+      "Parameters": {
+        "ApiEndpoint": "https://<lambda_id>.execute-api.us-east-2.amazonaws.com/<process_path>",
+        "Method": "POST",
+        "Authentication": {
+          "ConnectionArn": "arn:aws:events:us-east-2:<your_account_id>:connection/refinery-connection/<conn_id>"
+        },
+        "RequestBody.$": "$.toProcess.processingRequest"
+      },
+      "ResultSelector": {
+        "StatusCode.$": "$.StatusCode",
+        "Body.$": "$.ResponseBody"
+      },
+      "ResultPath": "$.pipeline",
+      "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckPipelineOK"
+    },
+    "CheckPipelineOK": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.scraper.statusCode",
+          "NumericGreaterThanEquals": 200,
+          "Next": "CheckPipelineSuccessBody"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "CheckPipelineSuccessBody": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.scraper.statusCode",
+              "NumericLessThan": 300
+            }
+          ],
+          "Next": "NotifySuccess"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::http:invoke",
+      "Parameters": {
+        "ApiEndpoint": "https://<lambda_id>.execute-api.us-east-2.amazonaws.com/<notify_path>",
+        "Method": "POST",
+        "Authentication": {
+          "ConnectionArn": "arn:aws:events:us-east-2:<your_account_id>:connection/botline-connection/<conn_id>"
+        },
+        "RequestBody": {
+          "service": "orchestrator-step-functions",
+          "error": "",
+          "message.$": "States.Format('✅ webscanner → pipeline-refinery OK. Processed: {}. Total runtime: {} ms', $.pipeline.Body.resultsProcessed, $.pipeline.Body.executionTime)",
+          "level": "info",
+          "payload": {
+            "scrapingSummary": "Alright, Cowboy 🤠 everything was OK 🤠👍🏼"
+          }
+        }
+      },
+      "ResultPath": "$.notifySuccess",
+      "End": true,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "SilentEnd"
+        }
+      ]
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::http:invoke",
+      "Parameters": {
+        "ApiEndpoint": "https://<lambda_id>.execute-api.us-east-2.amazonaws.com/<notify_path>",
+        "Method": "POST",
+        "Authentication": {
+          "ConnectionArn": "arn:aws:events:us-east-2:<your_account_id>:connection/botline-connection/<conn_id>"
+        },
+        "RequestBody": {
+          "service": "orchestrator-step-functions",
+          "error.$": "States.JsonToString($.error)",
+          "message": "❌ Refinery Pipeline Error 💀",
+          "level": "error",
+          "payload": {
+            "scraperOutput.$": "$.scraper",
+            "lastStateInput.$": "$"
+          }
+        }
+      },
+      "ResultPath": "$.notifyFailure",
+      "Next": "SilentEnd",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "SilentEnd"
+        }
+      ]
+    },
+    "SilentEnd": {
+      "Type": "Succeed"
+    }
+  }
+}
